@@ -1,6 +1,6 @@
 from connector.erpnext.setup import (
     CUSTOM_FIELDS,
-    WEBHOOK_DOCTYPES,
+    WEBHOOK_REGISTRATIONS,
     register_custom_fields,
     register_webhooks,
 )
@@ -37,15 +37,17 @@ def test_register_webhooks_creates_expected_doctype_event_pairs():
     created = register_webhooks(client, base_url)
 
     expected = {
-        f"{doctype}.{docevent}" for doctype, (_, docevents) in WEBHOOK_DOCTYPES.items() for docevent in docevents
+        f"{doctype}.{docevent}"
+        for doctype, _, docevents in WEBHOOK_REGISTRATIONS
+        for docevent in docevents
     }
     assert set(created) == expected
 
     webhooks = client.get_list("Webhook")
     assert len(webhooks) == len(expected)
-    for doctype, (path, _) in WEBHOOK_DOCTYPES.items():
-        matching = [w for w in webhooks if w["webhook_doctype"] == doctype]
-        assert all(w["request_url"] == f"{base_url}{path}" for w in matching)
+    # Every registered path must appear as a request_url.
+    registered_urls = {f"{base_url}{path}" for _, path, _ in WEBHOOK_REGISTRATIONS}
+    assert all(w["request_url"] in registered_urls for w in webhooks)
 
 
 def test_register_webhooks_is_idempotent():

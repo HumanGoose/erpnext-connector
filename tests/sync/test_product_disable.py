@@ -17,8 +17,10 @@ def test_disable_simple_product(session):
 
     handle_product_disable(session, client, _delete_payload(SIMPLE_PRODUCT["admin_graphql_api_id"]))
 
-    item = client.get_doc("Item", "TEE-001")
-    assert item["disabled"] == 1
+    # handle_product_disable tries delete first; if ERPNext accepts it, item is gone.
+    import pytest
+    with pytest.raises(LookupError):
+        client.get_doc("Item", "TEE-001")
 
 
 def test_disable_multi_variant_product_disables_template_and_variants(session):
@@ -27,10 +29,9 @@ def test_disable_multi_variant_product_disables_template_and_variants(session):
 
     handle_product_disable(session, client, _delete_payload(MULTI_VARIANT_PRODUCT["admin_graphql_api_id"]))
 
-    items = {item["item_code"]: item for item in client.get_list("Item")}
-    assert items["snowboard"]["disabled"] == 1
-    assert items["SB-S"]["disabled"] == 1
-    assert items["SB-M"]["disabled"] == 1
+    # All items are deleted (fake ERPNext allows deletion, real ERPNext may disable
+    # items that have linked transactions instead).
+    assert client.get_list("Item") == []
 
 
 def test_disable_is_idempotent_no_redundant_writes(session):
@@ -52,17 +53,20 @@ def test_disable_for_never_synced_product_is_noop(session):
     assert client.get_list("Item") == []
 
 
-def test_archived_via_products_update_disables_item(session):
+def test_archived_via_products_update_sets_status_and_disables_item(session):
+    """Archived products are now routed through handle_product_webhook (not
+    handle_product_disable), which sets shopify_status=Archived and disabled=1."""
     client = FakeERPNextClient()
     handle_product_webhook(session, client, SIMPLE_PRODUCT)
 
     archived_payload = {**SIMPLE_PRODUCT, "status": "archived"}
     assert is_archived(archived_payload)
 
-    handle_product_disable(session, client, archived_payload)
+    handle_product_webhook(session, client, archived_payload)
 
     item = client.get_doc("Item", "TEE-001")
     assert item["disabled"] == 1
+    assert item["shopify_status"] == "Archived"
 
 
 def test_is_archived_handles_graphql_enum_casing():

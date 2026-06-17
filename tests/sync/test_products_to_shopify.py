@@ -4,7 +4,8 @@ from sqlmodel import select
 
 from connector.models import EntityType, SyncedEntity
 from connector.sync import entities
-from connector.sync.products_to_shopify import handle_item_price_webhook, handle_item_webhook
+from connector.sync.products import handle_product_webhook
+from connector.sync.products_to_shopify import handle_item_delete_webhook, handle_item_price_webhook, handle_item_webhook
 from tests.erpnext.fakes import FakeERPNextClient
 from tests.shopify.fakes import FakeShopifyClient
 
@@ -87,7 +88,13 @@ def test_new_template_creates_shopify_product_with_options(session):
     assert template_entity.shopify_gid == product_gid
     assert len(variant_entities) == 2
     assert all(e.group_key == product_gid for e in variant_entities)
-    assert all(e.shopify_fingerprint == e.erpnext_fingerprint for e in rows)
+    # VARIANT fingerprints are symmetric; PRODUCT fingerprints intentionally differ
+    # because erpnext_fp extends the canonical with ERPNext-only fields (collections,
+    # category) to detect changes to those fields even when nothing else changes.
+    assert all(e.shopify_fingerprint == e.erpnext_fingerprint for e in variant_entities)
+    assert template_entity.shopify_fingerprint != template_entity.erpnext_fingerprint
+    assert template_entity.shopify_fingerprint is not None
+    assert template_entity.erpnext_fingerprint is not None
 
 
 def test_unsynced_item_and_variant_are_skipped(session):
@@ -158,7 +165,8 @@ def test_title_and_description_update_updates_shopify_product(session):
     assert args[1]["descriptionHtml"] == "<p>An even better snowboard!</p>"
 
     entity = entities.get_by_erpnext(session, EntityType.PRODUCT, "Item", "snowboard")
-    assert entity.shopify_fingerprint == entity.erpnext_fingerprint
+    assert entity.shopify_fingerprint is not None
+    assert entity.erpnext_fingerprint is not None
 
 
 def test_new_variant_on_existing_template_creates_variant(session):
@@ -180,10 +188,12 @@ def test_new_variant_on_existing_template_creates_variant(session):
 
     handle_item_webhook(session, shopify, client, variant_large)
 
-    method, kwargs = shopify.calls[-1]
-    assert method == "create_variants"
+    # The last create_variants call should be for variant_large.
+    create_variant_calls = [c for c in shopify.calls if c[0] == "create_variants"]
+    assert create_variant_calls, "No create_variants call found"
+    _, kwargs = create_variant_calls[-1]
     assert kwargs["product_gid"] == product_gid
-    assert kwargs["variants"] == [{"sku": "SB-L", "optionValues": [{"name": "Large", "optionName": "Size"}]}]
+    assert kwargs["variants"] == [{"inventoryItem": {"sku": "SB-L"}, "optionValues": [{"name": "Large", "optionName": "Size"}]}]
 
     assert client.get_doc("Item", "SB-L")["shopify_variant_gid"]
 
@@ -226,7 +236,7 @@ def test_new_simple_item_creates_shopify_product_with_default_variant(session):
     assert len(create_calls) == 1
     product_input = create_calls[0][1]["product_input"]
     assert product_input["title"] == "Widget"
-    assert product_input["variants"] == [{"sku": "widget", "price": "9.99"}]
+    assert product_input["variants"] == [{"inventoryItem": {"sku": "widget", "tracked": True}, "price": "9.99"}]
 
     doc = client.get_doc("Item", "widget")
     assert doc["shopify_product_gid"]
@@ -234,7 +244,8 @@ def test_new_simple_item_creates_shopify_product_with_default_variant(session):
 
     entity = entities.get_by_erpnext(session, EntityType.PRODUCT, "Item", "widget")
     assert entity.shopify_gid == doc["shopify_product_gid"]
-    assert entity.shopify_fingerprint == entity.erpnext_fingerprint
+    assert entity.shopify_fingerprint is not None
+    assert entity.erpnext_fingerprint is not None
 
 
 def test_item_price_change_updates_shopify_variant_price(session):
@@ -317,3 +328,324 @@ def test_item_price_for_unsynced_item_is_skipped(session):
     handle_item_price_webhook(session, shopify, client, payload)
 
     assert shopify.calls == []
+
+
+def test_delete_simple_item_deletes_shopify_product(session):
+    """Deleting a simple ERPNext item (no variant_of) must delete the Shopify product."""
+    client = FakeERPNextClient()
+    shopify = FakeShopifyClient()
+
+    item = client.insert(
+        {
+            "doctype": "Item",
+            "name": "widget",
+            "item_code": "widget",
+            "item_name": "Widget",
+            "description": "<p>A widget</p>",
+            "has_variants": 0,
+            "variant_of": None,
+            "sync_to_shopify": 1,
+            "attributes": [],
+            "image": "",
+        }
+    )
+    handle_item_webhook(session, shopify, client, item)
+
+    doc = client.get_doc("Item", "widget")
+    product_gid = doc["shopify_product_gid"]
+    variant_gid = doc["shopify_variant_gid"]
+
+    payload = {
+        "name": "widget",
+        "doctype": "Item",
+        "shopify_product_gid": product_gid,
+        "shopify_variant_gid": variant_gid,
+        "variant_of": "",
+    }
+    handle_item_delete_webhook(session, shopify, payload)
+
+    delete_calls = [c for c in shopify.calls if c[0] == "delete_product"]
+    assert len(delete_calls) == 1
+    assert delete_calls[0][1]["product_gid"] == product_gid
+
+    variant_delete_calls = [c for c in shopify.calls if c[0] == "delete_variants"]
+    assert variant_delete_calls == []
+
+    assert entities.get_by_erpnext(session, EntityType.PRODUCT, "Item", "widget") is None
+
+
+def test_delete_variant_item_deletes_shopify_variant(session):
+    """Deleting an ERPNext variant item (variant_of set) must remove just that Shopify variant."""
+    client, shopify, template, variant_small, variant_medium, product_gid = _synced_catalog(session)
+
+    variant_gid = variant_small["shopify_variant_gid"]
+    payload = {
+        "name": "SB-S",
+        "doctype": "Item",
+        "shopify_product_gid": product_gid,
+        "shopify_variant_gid": variant_gid,
+        "variant_of": "snowboard",
+    }
+    handle_item_delete_webhook(session, shopify, payload)
+
+    delete_variant_calls = [c for c in shopify.calls if c[0] == "delete_variants"]
+    assert len(delete_variant_calls) == 1
+    assert delete_variant_calls[0][1]["product_gid"] == product_gid
+    assert delete_variant_calls[0][1]["variant_gids"] == [variant_gid]
+
+    delete_product_calls = [c for c in shopify.calls if c[0] == "delete_product"]
+    assert delete_product_calls == []
+
+    assert entities.get_by_erpnext(session, EntityType.VARIANT, "Item", "SB-S") is None
+
+
+def test_delete_unsynced_item_makes_no_shopify_calls(session):
+    shopify = FakeShopifyClient()
+    payload = {"name": "widget", "doctype": "Item", "shopify_product_gid": "", "shopify_variant_gid": "", "variant_of": ""}
+    handle_item_delete_webhook(session, shopify, payload)
+    assert shopify.calls == []
+
+
+def _simple_item_fixture():
+    client = FakeERPNextClient()
+    client.insert(
+        {
+            "doctype": "Item",
+            "name": "widget",
+            "item_code": "widget",
+            "item_name": "Widget",
+            "description": "<p>A widget</p>",
+            "has_variants": 0,
+            "variant_of": None,
+            "sync_to_shopify": 1,
+            "attributes": [],
+            "image": "",
+        }
+    )
+    client.insert(
+        {
+            "doctype": "Item Price",
+            "name": "IP-W",
+            "item_code": "widget",
+            "price_list": "Standard Selling",
+            "price_list_rate": 9.99,
+        }
+    )
+    return client
+
+
+def test_simple_item_second_webhook_with_gid_set_does_not_create_duplicate(session):
+    """Simulate the race: GID is set on item but entity not yet saved.
+    The second ERPNext webhook must update, not create a second Shopify product."""
+    client = _simple_item_fixture()
+    shopify = FakeShopifyClient()
+
+    # First webhook — creates product and saves entity.
+    item = client.get_doc("Item", "widget")
+    handle_item_webhook(session, shopify, client, item)
+
+    product_gid = client.get_doc("Item", "widget")["shopify_product_gid"]
+    assert product_gid
+
+    # Simulate a second webhook that arrives with GID already set (race window).
+    # The entity IS in the DB at this point, but even if it weren't, no second
+    # product should be created because the GID field gates creation.
+    item_with_gid = client.get_doc("Item", "widget")
+    spy = MagicMock(wraps=shopify)
+    handle_item_webhook(session, spy, client, item_with_gid)
+
+    spy.create_product.assert_not_called()
+    spy.update_product.assert_not_called()  # also an echo (fingerprint matches)
+
+
+def test_shopify_products_create_echo_does_not_trigger_erpnext_update(session):
+    """After ERPNext→Shopify creates a product, the Shopify products/create webhook
+    must be detected as an echo so it doesn't write back to ERPNext and loop."""
+    client = _simple_item_fixture()
+    shopify = FakeShopifyClient()
+
+    item = client.get_doc("Item", "widget")
+    handle_item_webhook(session, shopify, client, item)
+
+    doc = client.get_doc("Item", "widget")
+    product_gid = doc["shopify_product_gid"]
+    variant_gid = doc["shopify_variant_gid"]
+
+    # Simulate the Shopify products/create callback that fires right after.
+    shopify_payload = {
+        "id": 1,
+        "admin_graphql_api_id": product_gid,
+        "title": "Widget",
+        "body_html": "<p>A widget</p>",
+        "handle": "widget",
+        "status": "active",
+        "options": [{"id": 1, "name": "Title", "position": 1, "values": ["Default Title"]}],
+        "variants": [
+            {
+                "id": 10,
+                "admin_graphql_api_id": variant_gid,
+                "title": "Default Title",
+                "sku": "widget",
+                "price": "9.99",
+                "option1": "Default Title",
+            }
+        ],
+    }
+
+    spy_client = MagicMock(wraps=client)
+    handle_product_webhook(session, spy_client, shopify_payload)
+
+    spy_client.insert.assert_not_called()
+    spy_client.update.assert_not_called()
+    spy_client.set_value.assert_not_called()
+
+
+def test_erpnext_on_update_echo_after_shopify_writeback_does_not_loop(session):
+    """After Shopify→ERPNext writes back to ERPNext, the triggered on_update must
+    be detected as an echo by the ERPNext→Shopify handler to stop the loop."""
+    client = _simple_item_fixture()
+    shopify = FakeShopifyClient()
+
+    # Step 1: ERPNext→Shopify creates the product.
+    item = client.get_doc("Item", "widget")
+    handle_item_webhook(session, shopify, client, item)
+
+    doc = client.get_doc("Item", "widget")
+    product_gid = doc["shopify_product_gid"]
+    variant_gid = doc["shopify_variant_gid"]
+
+    # Step 2: Shopify fires products/create; connector writes back to ERPNext.
+    shopify_payload = {
+        "id": 1,
+        "admin_graphql_api_id": product_gid,
+        "title": "Widget",
+        "body_html": "<p>A widget</p>",
+        "handle": "widget",
+        "status": "active",
+        "options": [{"id": 1, "name": "Title", "position": 1, "values": ["Default Title"]}],
+        "variants": [
+            {
+                "id": 10,
+                "admin_graphql_api_id": variant_gid,
+                "title": "Default Title",
+                "sku": "widget",
+                "price": "9.99",
+                "option1": "Default Title",
+            }
+        ],
+    }
+    handle_product_webhook(session, client, shopify_payload)
+
+    # Step 3: ERPNext fires on_update from that write. Must be an echo.
+    doc_after_writeback = client.get_doc("Item", "widget")
+    spy = MagicMock(wraps=shopify)
+    handle_item_webhook(session, spy, client, doc_after_writeback)
+
+    spy.create_product.assert_not_called()
+    spy.update_product.assert_not_called()
+
+
+def test_disabled_simple_item_pushes_archived_status_to_shopify(session):
+    """disabled=1 on an ERPNext Item must archive the Shopify product — the
+    key fallback for items that can't be hard-deleted due to linked transactions."""
+    client = _simple_item_fixture()
+    shopify = FakeShopifyClient()
+
+    # First sync — creates the product.
+    item = client.get_doc("Item", "widget")
+    handle_item_webhook(session, shopify, client, item)
+
+    # User disables the item in ERPNext (the fallback when hard-delete is blocked).
+    item_disabled = dict(client.get_doc("Item", "widget"))
+    item_disabled["disabled"] = 1
+
+    spy = MagicMock(wraps=shopify)
+    handle_item_webhook(session, spy, client, item_disabled)
+
+    spy.update_product.assert_called_once()
+    product_input = spy.update_product.call_args[0][1]
+    assert product_input.get("status") == "ARCHIVED"
+
+
+def test_archived_shopify_status_field_pushes_archived_to_shopify(session):
+    """shopify_status='Archived' on the ERPNext item must send ARCHIVED to Shopify.
+    Previously the status lookup always defaulted to ACTIVE due to a case mismatch."""
+    client = _simple_item_fixture()
+    shopify = FakeShopifyClient()
+
+    item = client.get_doc("Item", "widget")
+    handle_item_webhook(session, shopify, client, item)
+
+    item_archived = dict(client.get_doc("Item", "widget"))
+    item_archived["shopify_status"] = "Archived"
+
+    spy = MagicMock(wraps=shopify)
+    handle_item_webhook(session, spy, client, item_archived)
+
+    spy.update_product.assert_called_once()
+    product_input = spy.update_product.call_args[0][1]
+    assert product_input.get("status") == "ARCHIVED"
+
+
+def test_template_item_with_no_variants_defers_shopify_creation(session):
+    """A template item saved before any variants exist must NOT call Shopify —
+    creating a product with empty option values would be rejected by Shopify."""
+    client = FakeERPNextClient()
+    shopify = FakeShopifyClient()
+
+    # Insert template only — no variants yet.
+    template = client.insert(dict(TEMPLATE_ITEM))
+    handle_item_webhook(session, shopify, client, template)
+
+    create_calls = [c for c in shopify.calls if c[0] == "create_product"]
+    assert create_calls == []
+    assert session.exec(select(SyncedEntity)).all() == []
+
+
+def test_variant_webhook_creates_template_first_when_template_not_in_shopify(session):
+    """When the first variant arrives and the template was deferred (no Shopify
+    product yet), the variant handler must create the template product first,
+    then attach the variant."""
+    client = FakeERPNextClient()
+    shopify = FakeShopifyClient()
+
+    # Template inserted with no variants — webhook fires, gets deferred.
+    template = client.insert(dict(TEMPLATE_ITEM))
+    handle_item_webhook(session, shopify, client, template)
+    assert [c[0] for c in shopify.calls] == []
+
+    # Now the first variant is created in ERPNext and its webhook fires.
+    # The handler must lazy-create the Shopify product (using this variant's
+    # option value) and then attach the variant.
+    variant_small = client.insert(dict(VARIANT_SMALL))
+    handle_item_webhook(session, shopify, client, variant_small)
+
+    methods = [c[0] for c in shopify.calls]
+    assert "create_product" in methods
+    assert "create_variants" in methods
+    assert methods.index("create_product") < methods.index("create_variants")
+
+    product_gid = client.get_doc("Item", "snowboard")["shopify_product_gid"]
+    assert product_gid
+
+    entity = entities.get_by_erpnext(session, EntityType.VARIANT, "Item", "SB-S")
+    assert entity is not None
+    assert entity.group_key == product_gid
+
+
+def test_delete_template_item_cleans_up_variant_entities(session):
+    """Deleting a template item must remove its VARIANT SyncedEntity rows so
+    they don't linger as orphaned records after the Shopify product is deleted."""
+    client, shopify, template, variant_small, variant_medium, product_gid = _synced_catalog(session)
+
+    payload = {
+        "name": "snowboard",
+        "doctype": "Item",
+        "shopify_product_gid": product_gid,
+        "shopify_variant_gid": "",
+        "variant_of": "",
+    }
+    handle_item_delete_webhook(session, shopify, payload)
+
+    remaining = session.exec(select(SyncedEntity)).all()
+    assert remaining == []

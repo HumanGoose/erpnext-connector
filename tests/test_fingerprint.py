@@ -37,6 +37,10 @@ GRAPHQL_PRODUCT = {
     "id": "gid://shopify/Product/1071559771",
     "title": "Burton Custom Freestyle 151",
     "descriptionHtml": "<p>Good snowboard!</p>",
+    "vendor": "Burton",
+    "productType": "Snowboard",
+    "tags": [],
+    "status": "ACTIVE",
     "handle": "burton-custom-freestyle-151",
     "updatedAt": "2024-01-02T00:00:00Z",
     "options": [
@@ -83,6 +87,10 @@ def test_canonicalize_product_webhook_and_graphql_match():
         "title": "Burton Custom Freestyle 151",
         "description": "<p>Good snowboard!</p>",
         "options": [{"name": "Size", "values": ["Small", "Medium", "Large"]}],
+        "vendor": "Burton",
+        "product_type": "Snowboard",
+        "tags": [],
+        "status": "ACTIVE",
         "featured_image": "",
         "media": [],
     }
@@ -101,6 +109,7 @@ def test_canonicalize_variant_webhook_and_graphql_match():
         "title": "Small",
         "selected_options": [{"name": "Size", "value": "Small"}],
         "price": "100.00",
+        "image": "",
     }
     assert fingerprint(webhook_canonical) == fingerprint(graphql_canonical)
 
@@ -109,8 +118,6 @@ def test_canonicalize_variant_webhook_and_graphql_match():
     "mutate",
     [
         lambda raw: raw.__setitem__("updated_at", "2099-12-31T00:00:00-05:00"),
-        lambda raw: raw.__setitem__("vendor", "A Different Vendor"),
-        lambda raw: raw.__setitem__("product_type", "Different Type"),
         lambda raw: raw.__setitem__("handle", "a-different-handle"),
     ],
 )
@@ -132,6 +139,9 @@ def test_product_fingerprint_unchanged_by_untracked_fields(mutate):
             "options",
             [{"id": 1, "product_id": 1071559771, "name": "Size", "position": 1, "values": ["Small", "Large"]}],
         ),
+        lambda raw: raw.__setitem__("vendor", "A Different Vendor"),
+        lambda raw: raw.__setitem__("product_type", "Different Type"),
+        lambda raw: raw.__setitem__("status", "draft"),
     ],
 )
 def test_product_fingerprint_changes_for_tracked_fields(mutate):

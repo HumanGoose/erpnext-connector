@@ -31,15 +31,23 @@ class FakeShopifyClient:
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
 
+    def find_product_by_handle(self, handle: str) -> dict[str, Any] | None:
+        self._record("find_product_by_handle", handle=handle)
+        for product in self.products.values():
+            if product.get("handle") == handle:
+                return dict(product)
+        return None
+
     def create_product(self, product_input: dict[str, Any]) -> dict[str, Any]:
         self._record("create_product", product_input=product_input)
         gid = self._gid("Product")
         variants = []
         for raw in product_input.get("variants") or [{}]:
             variant_gid = self._gid("ProductVariant")
-            variant = {"id": variant_gid, "sku": raw.get("sku") or "", "price": raw.get("price")}
+            inv_gid = self._gid("InventoryItem")
+            variant = {"id": variant_gid, "sku": raw.get("sku") or "", "price": raw.get("price"), "inventoryItem": {"id": inv_gid}}
             self.variants[variant_gid] = variant
-            variants.append({"id": variant_gid, "sku": variant["sku"]})
+            variants.append({"id": variant_gid, "sku": variant["sku"], "inventoryItem": {"id": inv_gid}})
         self.products[gid] = {"id": gid, **product_input, "variants": variants}
         return {"id": gid, "variants": variants}
 
@@ -53,9 +61,10 @@ class FakeShopifyClient:
         created = []
         for raw in variants:
             variant_gid = self._gid("ProductVariant")
-            variant = {"id": variant_gid, "sku": raw.get("sku") or "", "price": raw.get("price")}
+            inv_gid = self._gid("InventoryItem")
+            variant = {"id": variant_gid, "sku": raw.get("sku") or "", "price": raw.get("price"), "inventoryItem": {"id": inv_gid}}
             self.variants[variant_gid] = variant
-            created.append({"id": variant_gid, "sku": variant["sku"]})
+            created.append({"id": variant_gid, "sku": variant["sku"], "inventoryItem": {"id": inv_gid}})
         return created
 
     def update_variant_price(self, product_gid: str, variant_gid: str, price: str) -> dict[str, Any]:
@@ -67,6 +76,35 @@ class FakeShopifyClient:
         self._record("append_product_media", product_gid=product_gid, media_urls=media_urls)
         self.media[product_gid].extend(media_urls)
         return {"media": [{"id": self._gid("MediaImage")} for _ in media_urls]}
+
+    def get_or_create_product_image_id(self, product_gid: str, image_url: str) -> str | None:
+        self._record("get_or_create_product_image_id", product_gid=product_gid, image_url=image_url)
+        bare = image_url.split("?")[0]
+        # Return an existing image GID if already stored, otherwise create one.
+        images = self.products.get(product_gid, {}).get("_images", {})
+        if bare not in images:
+            image_gid = self._gid("ProductImage")
+            self.products.setdefault(product_gid, {"id": product_gid}).setdefault("_images", {})[bare] = image_gid
+            images = self.products[product_gid]["_images"]
+        return images[bare]
+
+    def update_variants(self, product_gid: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._record("update_variants", product_gid=product_gid, variants=variants)
+        updated = []
+        for raw in variants:
+            gid = raw.get("id") or self._gid("ProductVariant")
+            self.variants.setdefault(gid, {"id": gid}).update(raw)
+            updated.append({"id": gid, "sku": raw.get("sku") or "", "price": raw.get("price")})
+        return updated
+
+    def delete_product(self, product_gid: str) -> None:
+        self._record("delete_product", product_gid=product_gid)
+        self.products.pop(product_gid, None)
+
+    def delete_variants(self, product_gid: str, variant_gids: list[str]) -> None:
+        self._record("delete_variants", product_gid=product_gid, variant_gids=variant_gids)
+        for gid in variant_gids:
+            self.variants.pop(gid, None)
 
     def set_inventory_quantity(self, inventory_item_gid: str, location_gid: str, quantity: int) -> dict[str, Any]:
         self._record(
