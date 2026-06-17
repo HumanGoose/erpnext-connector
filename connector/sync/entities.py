@@ -43,6 +43,15 @@ def get_group(session: Session, group_key: str, entity_type: EntityType | None =
 
 def save(session: Session, entity: SyncedEntity | None, **fields: Any) -> SyncedEntity:
     if entity is None:
+        # Guard against duplicates: check if an entity already exists for this
+        # (entity_type, shopify_gid) pair before inserting a new row.
+        entity_type = fields.get("entity_type")
+        shopify_gid = fields.get("shopify_gid")
+        if entity_type and shopify_gid:
+            existing = get_by_shopify_gid(session, entity_type, shopify_gid)
+            if existing is not None:
+                entity = existing
+    if entity is None:
         entity = SyncedEntity(**fields)
     else:
         for key, value in fields.items():

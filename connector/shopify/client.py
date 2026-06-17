@@ -1,3 +1,4 @@
+import re
 import time
 from functools import lru_cache
 from typing import Any, Protocol
@@ -7,6 +8,18 @@ import httpx
 from connector.config import Settings, get_settings
 from connector.shopify import mutations
 from connector.shopify.models import GraphQLError, GraphQLResponse, ThrottleStatus
+
+
+def _title_to_handle(title: str) -> str:
+    """Approximate Shopify's handle generation from a product title.
+
+    Shopify lowercases the title, replaces non-alphanumeric characters with
+    hyphens, and collapses repeated hyphens. Used as a fallback when the
+    product input didn't include an explicit `handle` field.
+    """
+    handle = title.lower()
+    handle = re.sub(r"[^a-z0-9]+", "-", handle)
+    return handle.strip("-")
 
 
 class ShopifyGraphQLError(Exception):
@@ -30,15 +43,21 @@ class ShopifyClientProtocol(Protocol):
     depend on. Sync-handler tests fake this (per the PRD's Testing Decisions)
     rather than issuing real GraphQL."""
 
+    def find_product_by_handle(self, handle: str) -> dict[str, Any] | None: ...
+
     def create_product(self, product_input: dict[str, Any]) -> dict[str, Any]: ...
 
     def update_product(self, product_gid: str, product_input: dict[str, Any]) -> dict[str, Any]: ...
 
     def create_variants(self, product_gid: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
 
+    def update_variants(self, product_gid: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
+
     def update_variant_price(self, product_gid: str, variant_gid: str, price: str) -> dict[str, Any]: ...
 
     def append_product_media(self, product_gid: str, media_urls: list[str]) -> dict[str, Any]: ...
+
+    def get_or_create_product_image_id(self, product_gid: str, image_url: str) -> str | None: ...
 
     def set_inventory_quantity(self, inventory_item_gid: str, location_gid: str, quantity: int) -> dict[str, Any]: ...
 
@@ -51,6 +70,10 @@ class ShopifyClientProtocol(Protocol):
     def cancel_order(self, order_gid: str) -> dict[str, Any]: ...
 
     def create_fulfillment(self, fulfillment_input: dict[str, Any]) -> dict[str, Any]: ...
+
+    def delete_product(self, product_gid: str) -> None: ...
+
+    def delete_variants(self, product_gid: str, variant_gids: list[str]) -> None: ...
 
 
 class ShopifyClient:
@@ -65,11 +88,12 @@ class ShopifyClient:
         settings: Settings,
         transport: httpx.BaseTransport | None = None,
         cost_threshold: float = 50.0,
+        timeout: float = 30.0,
     ) -> None:
         self._settings = settings
         self._cost_threshold = cost_threshold
         self._throttle_status: ThrottleStatus | None = None
-        self._client = httpx.Client(transport=transport)
+        self._client = httpx.Client(transport=transport, timeout=timeout)
 
     def close(self) -> None:
         self._client.close()
@@ -136,12 +160,35 @@ class ShopifyClient:
 
     # --- semantic write methods (ShopifyClientProtocol) ---
 
+    def find_product_by_handle(self, handle: str) -> dict[str, Any] | None:
+        """Query Shopify for a product by its handle. Returns the product dict
+        (with variants list) or None if not found."""
+        response = self.execute(mutations.PRODUCT_BY_HANDLE_QUERY, {"handle": f"handle:{handle}"})
+        nodes = ((response.data or {}).get("products") or {}).get("nodes") or []
+        if not nodes:
+            return None
+        product = nodes[0]
+        variants = (product.get("variants") or {}).get("nodes") or []
+        product["variants"] = variants
+        return product
+
     def create_product(self, product_input: dict[str, Any]) -> dict[str, Any]:
         # `ProductInput` (API 2025-10) has no `variants` field; Shopify always
         # creates one default variant, which we then update in place via
         # `productVariantsBulkUpdate` to set its sku/price.
         variant_input = (product_input.pop("variants", None) or [None])[0]
-        result = self._mutate(mutations.PRODUCT_CREATE, {"input": product_input}, "productCreate")
+        try:
+            result = self._mutate(mutations.PRODUCT_CREATE, {"input": product_input}, "productCreate")
+        except ShopifyUserError as exc:
+            if any("handle" in (e.get("field") or "") or "Handle has already been taken" in (e.get("message") or "") for e in exc.user_errors):
+                # A product with this handle already exists in Shopify (from a prior
+                # incomplete sync or a manually created product). Find and return it
+                # so the caller can link the ERPNext item to it instead of failing.
+                handle = product_input.get("handle") or _title_to_handle(product_input.get("title") or "")
+                existing = self.find_product_by_handle(handle)
+                if existing:
+                    return existing
+            raise
         product = result.get("product") or {}
         variants = (product.get("variants") or {}).get("nodes") or []
         product["variants"] = variants
@@ -178,22 +225,53 @@ class ShopifyClient:
         )
         return result.get("productVariants") or []
 
-    def update_variant_price(self, product_gid: str, variant_gid: str, price: str) -> dict[str, Any]:
+    def update_variants(self, product_gid: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
         result = self._mutate(
             mutations.PRODUCT_VARIANTS_BULK_UPDATE,
-            {"productId": product_gid, "variants": [{"id": variant_gid, "price": price}]},
+            {"productId": product_gid, "variants": variants},
             "productVariantsBulkUpdate",
         )
-        variants = result.get("productVariants") or []
+        return result.get("productVariants") or []
+
+    def update_variant_price(self, product_gid: str, variant_gid: str, price: str) -> dict[str, Any]:
+        variants = self.update_variants(product_gid, [{"id": variant_gid, "price": price}])
         return variants[0] if variants else {}
 
     def append_product_media(self, product_gid: str, media_urls: list[str]) -> dict[str, Any]:
-        media = [
-            {"originalSource": url, "mediaContentType": "IMAGE"} for url in media_urls
+        parsed = self.execute(mutations.PRODUCT_MEDIA_QUERY, {"id": product_gid})
+        existing: set[str] = set()
+        product_data = (parsed.data or {}).get("product") or {}
+        for node in (product_data.get("media") or {}).get("nodes", []):
+            url = (node.get("image") or {}).get("url")
+            if url:
+                existing.add(url.split("?")[0])  # strip query params for comparison
+
+        new_media = [
+            {"originalSource": url, "mediaContentType": "IMAGE"}
+            for url in media_urls
+            if url.split("?")[0] not in existing
         ]
+        if not new_media:
+            return {}
         return self._mutate(
-            mutations.PRODUCT_CREATE_MEDIA, {"productId": product_gid, "media": media}, "productCreateMedia"
+            mutations.PRODUCT_CREATE_MEDIA, {"productId": product_gid, "media": new_media}, "productCreateMedia"
         )
+
+    def get_or_create_product_image_id(self, product_gid: str, image_url: str) -> str | None:
+        image_id = self._find_product_image_id(product_gid, image_url)
+        if image_id:
+            return image_id
+        self.append_product_media(product_gid, [image_url])
+        return self._find_product_image_id(product_gid, image_url)
+
+    def _find_product_image_id(self, product_gid: str, image_url: str) -> str | None:
+        response = self.execute(mutations.PRODUCT_IMAGES_QUERY, {"id": product_gid})
+        product_data = (response.data or {}).get("product") or {}
+        bare_url = image_url.split("?")[0]
+        for node in (product_data.get("images") or {}).get("nodes") or []:
+            if (node.get("src") or "").split("?")[0] == bare_url:
+                return node["id"]
+        return None
 
     def set_inventory_quantity(self, inventory_item_gid: str, location_gid: str, quantity: int) -> dict[str, Any]:
         variables = {
@@ -248,6 +326,16 @@ class ShopifyClient:
             mutations.FULFILLMENT_CREATE, {"fulfillment": fulfillment_input}, "fulfillmentCreateV2"
         )
         return result.get("fulfillment") or {}
+
+    def delete_product(self, product_gid: str) -> None:
+        self._mutate(mutations.PRODUCT_DELETE, {"input": {"id": product_gid}}, "productDelete")
+
+    def delete_variants(self, product_gid: str, variant_gids: list[str]) -> None:
+        self._mutate(
+            mutations.PRODUCT_VARIANTS_BULK_DELETE,
+            {"productId": product_gid, "variantsIds": variant_gids},
+            "productVariantsBulkDelete",
+        )
 
 
 @lru_cache

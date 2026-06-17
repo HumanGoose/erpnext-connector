@@ -7,6 +7,7 @@ single non-variant Item for single-variant products), per the PRD's
 Product & Variant mapping.
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +16,14 @@ from sqlmodel import Session, select
 from connector.erpnext.client import ERPNextClientProtocol
 from connector.fingerprint import canonicalize, fingerprint
 from connector.models import EntityType, SyncedEntity
+from connector.sync import entities as sync_entities
+from connector.sync.inventory import seed_inventory_entity
+
+logger = logging.getLogger(__name__)
+
+
+class ItemDeletedError(Exception):
+    """Raised when _upsert_item cannot update because the item was concurrently deleted."""
 
 # Defaults required by ERPNext's Item doctype that the PRD doesn't otherwise
 # specify; both exist in a fresh ERPNext install.
@@ -77,15 +86,18 @@ def handle_product_webhook(
     product_fingerprint = fingerprint(canonical_product)
     raw_variants = _raw_variants(payload)
 
-    if _is_simple_product(canonical_product, raw_variants):
-        _sync_simple_product(
-            session, erpnext_client, payload, product_gid, canonical_product, product_fingerprint, raw_variants[0]
-        )
-        return
+    try:
+        if _is_simple_product(canonical_product, raw_variants):
+            _sync_simple_product(
+                session, erpnext_client, payload, product_gid, canonical_product, product_fingerprint, raw_variants[0]
+            )
+            return
 
-    _sync_template_product(
-        session, erpnext_client, payload, product_gid, canonical_product, product_fingerprint, raw_variants
-    )
+        _sync_template_product(
+            session, erpnext_client, payload, product_gid, canonical_product, product_fingerprint, raw_variants
+        )
+    except ItemDeletedError as exc:
+        logger.info("Shopify product %s skipped: ERPNext item %r was deleted", product_gid, str(exc))
 
 
 def is_archived(payload: dict[str, Any]) -> bool:
@@ -104,11 +116,10 @@ def handle_product_disable(
     erpnext_client: ERPNextClientProtocol,
     payload: dict[str, Any],
 ) -> None:
-    """Disable the ERPNext Item(s) for an archived/deleted Shopify product.
+    """Delete (or disable) ERPNext Items when a Shopify product is hard-deleted.
 
-    Looks up the Synced Entity for the product's `shopify_product_gid` and
-    disables its template Item and all variant Items, without deleting them.
-    A product with no Synced Entity (never synced) is a no-op.
+    Tries to delete each Item outright; falls back to disabling it if ERPNext
+    rejects the deletion (e.g. item has linked transactions).
     """
     product_gid = _gid(payload)
 
@@ -116,23 +127,21 @@ def handle_product_disable(
     if template_entity is None:
         return
 
-    _disable_item_if_needed(session, erpnext_client, template_entity)
     for variant_entity in _get_variant_entities(session, product_gid):
-        _disable_item_if_needed(session, erpnext_client, variant_entity)
+        _delete_or_disable_item(erpnext_client, variant_entity)
+    _delete_or_disable_item(erpnext_client, template_entity)
 
 
-def _disable_item_if_needed(session: Session, erpnext_client: ERPNextClientProtocol, entity: SyncedEntity) -> None:
+def _delete_or_disable_item(erpnext_client: ERPNextClientProtocol, entity: SyncedEntity) -> None:
     if entity.erpnext_name is None:
         return
-
-    item = erpnext_client.get_doc("Item", entity.erpnext_name)
-    if item.get("disabled"):
-        return  # Echo: already disabled, no redundant write.
-
-    erpnext_client.set_value("Item", entity.erpnext_name, "disabled", 1)
-    entity.last_synced_at = _utcnow()
-    session.add(entity)
-    session.commit()
+    try:
+        erpnext_client.delete("Item", entity.erpnext_name)
+    except Exception:
+        try:
+            erpnext_client.set_value("Item", entity.erpnext_name, "disabled", 1)
+        except Exception:
+            pass
 
 
 def _get_variant_entities(session: Session, product_gid: str) -> list[SyncedEntity]:
@@ -153,14 +162,18 @@ def _sync_template_product(
     raw_variants: list[dict[str, Any]],
 ) -> None:
     template_entity = _get_synced_entity(session, EntityType.PRODUCT, product_gid)
-    template_item_code = payload.get("handle") or product_gid
+    existing_name = template_entity.erpnext_name if template_entity else None
+    template_item_code = existing_name or payload.get("handle") or product_gid
 
     if template_entity is None or template_entity.shopify_fingerprint != product_fingerprint:
         _ensure_item_attributes(erpnext_client, canonical_product["options"])
-        template_doc = _build_template_doc(template_item_code, canonical_product, product_gid)
-        existing_name = template_entity.erpnext_name if template_entity else None
+        item_group = _ensure_item_group(erpnext_client, canonical_product.get("product_type") or "")
+        template_doc = _build_template_doc(template_item_code, canonical_product, product_gid, item_group)
         result = _upsert_item(erpnext_client, template_doc, existing_name)
 
+        # Store the ERPNext-side fingerprint (with empty collections/category)
+        # so the on_update echo check in products_to_shopify matches immediately.
+        erpnext_fp = fingerprint({**canonical_product, "collections": [], "category": ""})
         template_entity = _save_synced_entity(
             session,
             template_entity,
@@ -170,12 +183,19 @@ def _sync_template_product(
             erpnext_doctype="Item",
             erpnext_name=result["name"],
             shopify_fingerprint=product_fingerprint,
-            erpnext_fingerprint=product_fingerprint,
+            erpnext_fingerprint=erpnext_fp,
         )
         _sync_product_images(erpnext_client, result["name"], canonical_product)
 
+    incoming_variant_gids = {_gid(v, "ProductVariant") for v in raw_variants}
+    for variant_entity in _get_variant_entities(session, product_gid):
+        if variant_entity.shopify_gid not in incoming_variant_gids:
+            _delete_or_disable_item(erpnext_client, variant_entity)
+
+    product_status = canonical_product.get("status", "ACTIVE")
     for raw_variant in raw_variants:
-        _sync_variant(session, erpnext_client, raw_variant, canonical_product["options"], product_gid, template_entity.erpnext_name)
+        variant_image = _variant_image_url(raw_variant, payload)
+        _sync_variant(session, erpnext_client, raw_variant, canonical_product["options"], product_gid, template_entity.erpnext_name, product_status, variant_image)
 
 
 def _sync_variant(
@@ -185,20 +205,28 @@ def _sync_variant(
     product_options: list[dict[str, Any]],
     product_gid: str,
     template_item_code: str,
+    product_status: str = "ACTIVE",
+    image_url: str = "",
 ) -> None:
     variant_gid = _gid(raw_variant, resource="ProductVariant")
     selected_options = _variant_selected_options(raw_variant, product_options)
-    canonical_variant = canonicalize(EntityType.VARIANT, {**raw_variant, "selected_options": selected_options})
+    canonical_variant = canonicalize(EntityType.VARIANT, {**raw_variant, "selected_options": selected_options, "image": image_url})
     variant_fingerprint = fingerprint(canonical_variant)
 
     variant_entity = _get_synced_entity(session, EntityType.VARIANT, variant_gid)
     if variant_entity is not None and variant_entity.shopify_fingerprint == variant_fingerprint:
-        return  # Echo: this variant's tracked fields haven't changed.
+        # Variant data unchanged, but status may have changed at the product level.
+        if variant_entity.erpnext_name:
+            _apply_product_status_to_variant(erpnext_client, variant_entity.erpnext_name, product_status)
+        return
 
-    item_code = canonical_variant["sku"] or variant_gid
-    variant_doc = _build_variant_doc(item_code, template_item_code, canonical_variant, product_gid, variant_gid)
+    inventory_item_gid = _inventory_item_gid(raw_variant)
     existing_name = variant_entity.erpnext_name if variant_entity else None
-    result = _upsert_item(erpnext_client, variant_doc, existing_name)
+    desired_item_code = canonical_variant["sku"] or variant_gid
+    # item_code is immutable in ERPNext once set — reuse the existing name on updates.
+    item_code = existing_name or desired_item_code
+    variant_doc = _build_variant_doc(item_code, template_item_code, canonical_variant, product_gid, variant_gid, inventory_item_gid, product_status, image_url)
+    result = _upsert_item(erpnext_client, variant_doc, existing_name, desired_item_code)
 
     # Shopify variant price -> ERPNext Item Price (issue 10).
     _sync_variant_price(erpnext_client, result["name"], canonical_variant["price"])
@@ -214,6 +242,9 @@ def _sync_variant(
         shopify_fingerprint=variant_fingerprint,
         erpnext_fingerprint=variant_fingerprint,
     )
+
+    if inventory_item_gid:
+        seed_inventory_entity(session, inventory_item_gid, variant_gid, result["name"])
 
 
 def _sync_simple_product(
@@ -236,24 +267,39 @@ def _sync_simple_product(
     if entity is not None and entity.shopify_fingerprint == item_fingerprint:
         return  # Echo: nothing tracked has changed.
 
-    item_code = sku or payload.get("handle") or product_gid
+    inventory_item_gid = _inventory_item_gid(raw_variant)
+    existing_name = entity.erpnext_name if entity else None
+    desired_item_code = sku or payload.get("handle") or product_gid
+    # item_code is immutable in ERPNext once set — reuse the existing name on updates.
+    item_code = existing_name or desired_item_code
+    item_group = _ensure_item_group(erpnext_client, canonical_product.get("product_type") or "")
+    status = canonical_product.get("status", "ACTIVE")
     doc = {
         "name": item_code,
         "item_code": item_code,
         "item_name": canonical_product["title"],
         "description": canonical_product["description"],
-        "item_group": DEFAULT_ITEM_GROUP,
+        "item_group": item_group,
         "stock_uom": DEFAULT_STOCK_UOM,
         "has_variants": 0,
         "shopify_product_gid": product_gid,
         "shopify_variant_gid": variant_gid,
+        "shopify_inventory_item_gid": inventory_item_gid,
+        "shopify_vendor": canonical_product.get("vendor") or "",
+        "shopify_tags": ", ".join(canonical_product.get("tags") or []),
+        "shopify_status": status.title(),
+        "disabled": 1 if status == "ARCHIVED" else 0,
         "image": canonical_product.get("featured_image", ""),
     }
-    existing_name = entity.erpnext_name if entity else None
-    result = _upsert_item(erpnext_client, doc, existing_name)
+    result = _upsert_item(erpnext_client, doc, existing_name, desired_item_code)
 
     _sync_variant_price(erpnext_client, result["name"], raw_variant.get("price"))
 
+    # erpnext_fp must use canonical_product (no sku/price) to match the formula
+    # _sync_simple_item uses: that handler computes erpnext_fp from _template_canonical
+    # which excludes sku/price, so both sides converge on the same hash and the
+    # ERPNext on_update echo-check fires correctly after this write.
+    erpnext_fp = fingerprint({**canonical_product, "collections": [], "category": ""})
     _save_synced_entity(
         session,
         entity,
@@ -263,23 +309,35 @@ def _sync_simple_product(
         erpnext_doctype="Item",
         erpnext_name=result["name"],
         shopify_fingerprint=item_fingerprint,
-        erpnext_fingerprint=item_fingerprint,
+        erpnext_fingerprint=erpnext_fp,
     )
     _sync_product_images(erpnext_client, result["name"], canonical_product)
 
+    if inventory_item_gid:
+        seed_inventory_entity(session, inventory_item_gid, product_gid, result["name"])
 
-def _build_template_doc(item_code: str, canonical_product: dict[str, Any], product_gid: str) -> dict[str, Any]:
+
+def _build_template_doc(
+    item_code: str,
+    canonical_product: dict[str, Any],
+    product_gid: str,
+    item_group: str,
+) -> dict[str, Any]:
+    status = canonical_product.get("status", "ACTIVE")
     return {
         "name": item_code,
         "item_code": item_code,
         "item_name": canonical_product["title"],
         "description": canonical_product["description"],
-        "item_group": DEFAULT_ITEM_GROUP,
+        "item_group": item_group,
         "stock_uom": DEFAULT_STOCK_UOM,
         "has_variants": 1,
         "attributes": [{"attribute": option["name"]} for option in canonical_product["options"]],
         "shopify_product_gid": product_gid,
-        # Featured image -> Item `image` field (issue 08); "" when absent.
+        "shopify_vendor": canonical_product.get("vendor") or "",
+        "shopify_tags": ", ".join(canonical_product.get("tags") or []),
+        "shopify_status": status.title(),
+        "disabled": 1 if status == "ARCHIVED" else 0,
         "image": canonical_product.get("featured_image", ""),
     }
 
@@ -325,6 +383,9 @@ def _build_variant_doc(
     canonical_variant: dict[str, Any],
     product_gid: str,
     variant_gid: str,
+    inventory_item_gid: str,
+    product_status: str = "ACTIVE",
+    image_url: str = "",
 ) -> dict[str, Any]:
     return {
         "name": item_code,
@@ -340,39 +401,183 @@ def _build_variant_doc(
         ],
         "shopify_product_gid": product_gid,
         "shopify_variant_gid": variant_gid,
+        "shopify_inventory_item_gid": inventory_item_gid,
+        "shopify_status": product_status.title(),
+        "disabled": 1 if product_status == "ARCHIVED" else 0,
+        "image": image_url,
     }
 
 
+def _apply_product_status_to_variant(
+    erpnext_client: ERPNextClientProtocol,
+    item_name: str,
+    product_status: str,
+) -> None:
+    """Push the product-level status down to a variant Item that hasn't otherwise changed."""
+    desired_status = product_status.title()
+    desired_disabled = 1 if product_status == "ARCHIVED" else 0
+    try:
+        item = erpnext_client.get_doc("Item", item_name)
+    except Exception:
+        return
+    if item is None:
+        return
+    if item.get("shopify_status") != desired_status:
+        erpnext_client.set_value("Item", item_name, "shopify_status", desired_status)
+    if bool(item.get("disabled")) != bool(desired_disabled):
+        erpnext_client.set_value("Item", item_name, "disabled", desired_disabled)
+
+
+def _variant_image_url(raw_variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    """Extract the image URL for a variant from the product webhook payload.
+
+    REST webhooks carry `image_id` (numeric) on the variant and the full image
+    objects (with `src`) in `payload["images"]`. GraphQL payloads may carry
+    `image.url` directly on the variant node.
+    """
+    image = raw_variant.get("image")
+    if isinstance(image, dict):
+        return image.get("url") or image.get("src") or ""
+
+    image_id = raw_variant.get("image_id")
+    if image_id:
+        for img in payload.get("images") or []:
+            if img.get("id") == image_id:
+                return img.get("src") or ""
+    return ""
+
+
+def _inventory_item_gid(raw_variant: dict[str, Any]) -> str:
+    """Extract the Shopify InventoryItem GID from a variant payload.
+
+    GraphQL variant nodes carry `inventoryItem.id`; webhook/REST payloads carry
+    the numeric `inventory_item_id`.
+    """
+    gid = (raw_variant.get("inventoryItem") or {}).get("id")
+    if gid:
+        return str(gid)
+    raw_id = raw_variant.get("inventory_item_id")
+    if raw_id is None:
+        return ""
+    if isinstance(raw_id, str) and raw_id.startswith("gid://"):
+        return raw_id
+    return f"gid://shopify/InventoryItem/{raw_id}"
+
+
+def _ensure_item_group(erpnext_client: ERPNextClientProtocol, product_type: str) -> str:
+    """Return the ERPNext Item Group name for `product_type`, creating it if absent."""
+    if not product_type:
+        return DEFAULT_ITEM_GROUP
+    existing = erpnext_client.get_list("Item Group", filters={"name": product_type}, fields=["name"])
+    if existing:
+        return product_type
+    erpnext_client.insert({
+        "doctype": "Item Group",
+        "item_group_name": product_type,
+        "parent_item_group": DEFAULT_ITEM_GROUP,
+    })
+    return product_type
+
+
 def _ensure_item_attributes(erpnext_client: ERPNextClientProtocol, options: list[dict[str, Any]]) -> None:
-    """Create any "Item Attribute" doctype docs the template Item references."""
+    """Create or update "Item Attribute" docs so all variant values are valid."""
     for option in options:
         existing = erpnext_client.get_list("Item Attribute", filters={"name": option["name"]}, fields=["name"])
-        if existing:
+        if not existing:
+            erpnext_client.insert(
+                {
+                    "doctype": "Item Attribute",
+                    "name": option["name"],
+                    "attribute_name": option["name"],
+                    "item_attribute_values": [
+                        {"attribute_value": value, "abbr": value} for value in option["values"]
+                    ],
+                }
+            )
             continue
-        erpnext_client.insert(
+
+        attr_doc = erpnext_client.get_doc("Item Attribute", option["name"])
+        existing_values = {row["attribute_value"] for row in attr_doc.get("item_attribute_values") or []}
+        new_values = [v for v in option["values"] if v not in existing_values]
+        if not new_values:
+            continue
+
+        merged = list(attr_doc.get("item_attribute_values") or []) + [
+            {"attribute_value": value, "abbr": value} for value in new_values
+        ]
+        erpnext_client.update(
             {
                 "doctype": "Item Attribute",
                 "name": option["name"],
-                "attribute_name": option["name"],
-                "item_attribute_values": [
-                    {"attribute_value": value, "abbr": value} for value in option["values"]
-                ],
+                "item_attribute_values": merged,
             }
         )
 
 
-def _upsert_item(erpnext_client: ERPNextClientProtocol, doc: dict[str, Any], existing_name: str | None) -> dict[str, Any]:
+def _upsert_item(
+    erpnext_client: ERPNextClientProtocol,
+    doc: dict[str, Any],
+    existing_name: str | None,
+    desired_item_code: str | None = None,
+) -> dict[str, Any]:
+    """Update `existing_name` if it still belongs to this Shopify entity, otherwise
+    create fresh using `desired_item_code` (falls back to doc["item_code"]).
+
+    `desired_item_code` must be passed whenever `existing_name` differs from the
+    intended new item code (e.g. SKU changed), so collision recovery creates the
+    right item instead of re-finding the colliding one."""
     name = existing_name
+    collision = False
+
+    if name is not None:
+        live = erpnext_client.get_list(
+            "Item",
+            filters={"name": name},
+            fields=["name", "shopify_variant_gid", "shopify_product_gid"],
+        )
+        if not live:
+            name = None  # Item deleted externally — create fresh.
+            collision = True
+        else:
+            expected_variant_gid = doc.get("shopify_variant_gid")
+            expected_product_gid = doc.get("shopify_product_gid")
+            actual = live[0]
+            if expected_variant_gid and actual.get("shopify_variant_gid") not in (None, "", expected_variant_gid):
+                name = None  # Collision: item belongs to a different variant.
+                collision = True
+            elif not expected_variant_gid and expected_product_gid and actual.get("shopify_product_gid") not in (None, "", expected_product_gid):
+                name = None  # Collision: item belongs to a different product.
+                collision = True
+
+    fresh_item_code = desired_item_code or doc["item_code"]
+
     if name is None:
-        # SKU (item_code) is the join key for items not yet tracked by a Synced Entity.
-        matches = erpnext_client.get_list("Item", filters={"item_code": doc["item_code"]}, fields=["name"])
+        # Always check by item_code before inserting — prevents DuplicateEntryError
+        # from race conditions (two concurrent webhooks for the same new product)
+        # and from the `collision` path where the item still physically exists.
+        matches = erpnext_client.get_list("Item", filters={"item_code": fresh_item_code}, fields=["name"])
         if matches:
             name = matches[0]["name"]
 
     if name is not None:
-        return erpnext_client.update({**doc, "doctype": "Item", "name": name})
+        try:
+            return erpnext_client.update({**doc, "doctype": "Item", "name": name})
+        except Exception as e:
+            # MySQL 1020 / Frappe QueryDeadlockError: the item's row is locked by
+            # a concurrent DELETE transaction. Re-check whether it's truly gone.
+            if not erpnext_client.get_list("Item", filters={"name": name}, fields=["name"]):
+                raise ItemDeletedError(name) from e
+            raise
 
-    return erpnext_client.insert({**doc, "doctype": "Item"})
+    create_doc = {**doc, "item_code": fresh_item_code, "name": fresh_item_code}
+    try:
+        return erpnext_client.insert({**create_doc, "doctype": "Item"})
+    except Exception as e:
+        # Last-resort: INSERT lost a race — another request created the item
+        # between our get_list check and the insert. Fall back to update.
+        if "DuplicateEntryError" in str(e) or "Duplicate entry" in str(e):
+            return erpnext_client.update({**doc, "doctype": "Item", "name": fresh_item_code})
+        raise
 
 
 def _get_synced_entity(session: Session, entity_type: EntityType, shopify_gid: str) -> SyncedEntity | None:

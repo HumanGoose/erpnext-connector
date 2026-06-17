@@ -81,6 +81,33 @@ def _image_fields(raw: dict[str, Any]) -> dict[str, Any]:
     return {"featured_image": featured, "media": media}
 
 
+def _tags(raw: dict[str, Any]) -> list[str]:
+    """Normalize Shopify tags to a sorted list.
+
+    Shopify webhooks/REST carry tags as a comma-separated string; GraphQL
+    returns a list. ERPNext stores them as a comma-separated string in the
+    `shopify_tags` custom field.
+    """
+    tags = raw.get("tags")
+    if tags is None:
+        return []
+    if isinstance(tags, list):
+        return sorted(t.strip() for t in tags if isinstance(t, str) and t.strip())
+    if isinstance(tags, str):
+        return sorted(t.strip() for t in tags.split(",") if t.strip())
+    return []
+
+
+def _status(raw: dict[str, Any]) -> str:
+    """Normalize product status to uppercase (ACTIVE/DRAFT/ARCHIVED).
+
+    Shopify webhooks use lowercase ("active"), GraphQL uses uppercase enums
+    ("ACTIVE"), and ERPNext stores title-case in `shopify_status` ("Active").
+    """
+    value = raw.get("status") or raw.get("shopify_status") or "ACTIVE"
+    return str(value).upper()
+
+
 def _canonicalize_product(raw: dict[str, Any]) -> CanonicalDict:
     title = raw.get("title") or ""
 
@@ -90,12 +117,46 @@ def _canonicalize_product(raw: dict[str, Any]) -> CanonicalDict:
         description = raw.get("body_html")
     description = description or ""
 
+    # Shopify automatically adds a "Title"/"Default Title" option to simple
+    # (single-variant) products; ERPNext simple items have no options. Strip it
+    # so both sides produce the same canonical — otherwise fingerprints never
+    # match and the echo check always fires, creating an endless update loop.
     options = [
         {"name": option.get("name", ""), "values": list(option.get("values") or [])}
         for option in raw.get("options") or []
+        if option.get("name") != "Title"
     ]
 
-    return {"title": title, "description": description, "options": options, **_image_fields(raw)}
+    # Vendor: same key across REST/webhook and GraphQL.
+    vendor = raw.get("vendor") or ""
+
+    # Product type: GraphQL uses `productType`; REST/webhook uses `product_type`.
+    product_type = raw.get("productType") or raw.get("product_type") or ""
+
+    return {
+        "title": title,
+        "description": description,
+        "options": options,
+        "vendor": vendor,
+        "product_type": product_type,
+        "tags": _tags(raw),
+        "status": _status(raw),
+        **_image_fields(raw),
+    }
+
+
+def _variant_image(raw: dict[str, Any]) -> str:
+    """Normalize the variant image to a bare URL (no query params).
+
+    The sync handlers pre-resolve the image URL (from the product's images
+    array for REST webhooks, or from item.image for ERPNext) and store it
+    under the `image` key before calling canonicalize. The Shopify CDN
+    appends query parameters that vary; strip them for stable comparison.
+    """
+    image = raw.get("image") or ""
+    if isinstance(image, dict):
+        image = image.get("url") or image.get("src") or ""
+    return str(image).split("?")[0] if image else ""
 
 
 def _canonicalize_variant(raw: dict[str, Any]) -> CanonicalDict:
@@ -122,6 +183,7 @@ def _canonicalize_variant(raw: dict[str, Any]) -> CanonicalDict:
         "title": title,
         "selected_options": normalized_options,
         "price": _money(raw.get("price")),
+        "image": _variant_image(raw),
     }
 
 

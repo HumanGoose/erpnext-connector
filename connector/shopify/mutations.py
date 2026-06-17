@@ -7,12 +7,24 @@ real client is usable against a live store during manual e2e validation (issue
 handlers store back as Synced Entity references.
 """
 
+PRODUCT_BY_HANDLE_QUERY = """
+query ConnectorProductByHandle($handle: String!) {
+  products(first: 1, query: $handle) {
+    nodes {
+      id
+      handle
+      variants(first: 100) { nodes { id sku inventoryItem { id } } }
+    }
+  }
+}
+"""
+
 PRODUCT_CREATE = """
 mutation ConnectorProductCreate($input: ProductInput!) {
   productCreate(input: $input) {
     product {
       id
-      variants(first: 100) { nodes { id sku } }
+      variants(first: 100) { nodes { id sku inventoryItem { id } } }
     }
     userErrors { field message }
   }
@@ -31,7 +43,7 @@ mutation ConnectorProductUpdate($input: ProductInput!) {
 PRODUCT_VARIANTS_BULK_CREATE = """
 mutation ConnectorVariantsCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
   productVariantsBulkCreate(productId: $productId, variants: $variants) {
-    productVariants { id sku }
+    productVariants { id sku inventoryItem { id } }
     userErrors { field message }
   }
 }
@@ -40,8 +52,28 @@ mutation ConnectorVariantsCreate($productId: ID!, $variants: [ProductVariantsBul
 PRODUCT_VARIANTS_BULK_UPDATE = """
 mutation ConnectorVariantsUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
   productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-    productVariants { id price }
+    productVariants { id sku price }
     userErrors { field message }
+  }
+}
+"""
+
+PRODUCT_MEDIA_QUERY = """
+query ConnectorProductMedia($id: ID!) {
+  product(id: $id) {
+    media(first: 250) {
+      nodes { ... on MediaImage { image { url } } }
+    }
+  }
+}
+"""
+
+PRODUCT_IMAGES_QUERY = """
+query ConnectorProductImages($id: ID!) {
+  product(id: $id) {
+    images(first: 250) {
+      nodes { id src }
+    }
   }
 }
 """
@@ -108,6 +140,24 @@ FULFILLMENT_CREATE = """
 mutation ConnectorFulfillmentCreate($fulfillment: FulfillmentInput!) {
   fulfillmentCreate(fulfillment: $fulfillment) {
     fulfillment { id status }
+    userErrors { field message }
+  }
+}
+"""
+
+PRODUCT_DELETE = """
+mutation ConnectorProductDelete($input: ProductDeleteInput!) {
+  productDelete(input: $input) {
+    deletedProductId
+    userErrors { field message }
+  }
+}
+"""
+
+PRODUCT_VARIANTS_BULK_DELETE = """
+mutation ConnectorVariantsDelete($productId: ID!, $variantsIds: [ID!]!) {
+  productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+    product { id }
     userErrors { field message }
   }
 }

@@ -1,15 +1,16 @@
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlmodel import Session
 
 from connector.config import Settings, get_settings
 from connector.db import get_session
 from connector.erpnext.client import ERPNextClientProtocol, get_erpnext_client
 from connector.shopify.webhooks import verify_webhook_hmac
-from connector.sync import customers, fulfillments, orders
-from connector.sync.products import handle_product_disable, handle_product_webhook, is_archived
+from connector.shopify.client import ShopifyClientProtocol, get_shopify_client
+from connector.sync import customers, fulfillments, inventory, orders
+from connector.sync.products import handle_product_disable, handle_product_webhook
 
 router = APIRouter()
 
@@ -33,21 +34,19 @@ async def _verified_payload(
 @router.post("/webhooks/shopify/products")
 async def shopify_products_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_shopify_hmac_sha256: str | None = Header(default=None),
     x_shopify_topic: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
     session: Session = Depends(get_session),
     erpnext_client: ERPNextClientProtocol = Depends(get_erpnext_client),
 ) -> dict[str, str]:
-    body = await request.body()
-    payload = json.loads(body)
+    payload = await _verified_payload(request, x_shopify_hmac_sha256, settings)
 
     if x_shopify_topic == "products/delete":
-        handle_product_disable(session, erpnext_client, payload)
-    elif x_shopify_topic == "products/update" and is_archived(payload):
-        handle_product_disable(session, erpnext_client, payload)
+        background_tasks.add_task(handle_product_disable, session, erpnext_client, payload)
     elif x_shopify_topic in ("products/create", "products/update"):
-        handle_product_webhook(session, erpnext_client, payload)
+        background_tasks.add_task(handle_product_webhook, session, erpnext_client, payload)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported topic: {x_shopify_topic!r}")
 
@@ -110,6 +109,20 @@ async def shopify_refunds_webhook(
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported topic: {x_shopify_topic!r}")
 
+    return {"status": "ok"}
+
+
+@router.post("/webhooks/shopify/inventory")
+async def shopify_inventory_webhook(
+    request: Request,
+    x_shopify_hmac_sha256: str | None = Header(default=None),
+    x_shopify_topic: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+    session: Session = Depends(get_session),
+    erpnext_client: ERPNextClientProtocol = Depends(get_erpnext_client),
+) -> dict[str, str]:
+    # Inventory sync disabled — Stock Reconciliation submission is unreliable
+    # on this Frappe version. Acknowledge the webhook so Shopify stops retrying.
     return {"status": "ok"}
 
 

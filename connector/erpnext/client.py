@@ -1,9 +1,29 @@
+import json
+import time
 from functools import lru_cache
 from typing import Any, Protocol
 
+import requests as _requests
 from frappeclient import FrappeClient
 
 from connector.config import Settings, get_settings
+
+_DEADLOCK_RETRIES = 3
+_DEADLOCK_DELAY = 0.5  # seconds between retries
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Returns True for transient ERPNext write errors worth retrying.
+
+    Two shapes:
+    - frappeclient raises JSONDecodeError when ERPNext returns a 500 HTML page
+      (the deadlock error page rendered by Frappe's exception handler).
+    - FrappeException / raw string contains the MySQL error 1020 text.
+    """
+    if isinstance(exc, (json.JSONDecodeError, _requests.exceptions.JSONDecodeError)):
+        return True
+    msg = str(exc)
+    return "1020" in msg or "QueryDeadlockError" in msg or "Record has changed since last read" in msg
 
 
 class ERPNextClientProtocol(Protocol):
@@ -67,19 +87,72 @@ class ERPNextClient:
         return self._client.insert(doc)
 
     def update(self, doc: dict[str, Any]) -> dict[str, Any]:
-        return self._client.update(doc)
+        last_exc: Exception | None = None
+        for attempt in range(_DEADLOCK_RETRIES):
+            try:
+                return self._client.update(doc)
+            except Exception as exc:
+                if _is_retryable(exc):
+                    last_exc = exc
+                    time.sleep(_DEADLOCK_DELAY * (attempt + 1))
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
 
     def delete(self, doctype: str, name: str) -> None:
         self._client.delete(doctype, name)
 
     def submit(self, doc: dict[str, Any]) -> dict[str, Any]:
-        return self._client.submit(doc)
+        """Submit a Frappe document (docstatus → 1).
+
+        frappeclient.submit() crashes with JSONDecodeError when Frappe returns
+        an empty or non-JSON body (observed in Frappe v15 on Stock Reconciliation
+        submit). We fall back to a direct PUT that sets docstatus=1 via the REST
+        resource endpoint, which is the canonical Frappe way to submit docs.
+        """
+        try:
+            result = self._client.submit(doc)
+            return result if isinstance(result, dict) else doc
+        except (json.JSONDecodeError, _requests.exceptions.JSONDecodeError, ValueError):
+            # Empty/non-JSON response — attempt the REST PUT fallback.
+            pass
+
+        name = doc.get("name")
+        doctype = doc.get("doctype")
+        if not name or not doctype:
+            raise RuntimeError(f"Cannot submit doc without doctype/name: {doc}")
+
+        url = f"{self._client.url}/api/resource/{doctype}/{name}"
+        resp = self._client.session.put(
+            url,
+            data={"data": json.dumps({**doc, "docstatus": 1})},
+            verify=self._client.verify,
+        )
+        resp.raise_for_status()
+        try:
+            return resp.json().get("data") or doc
+        except Exception:
+            # If that also returns empty body, check docstatus and trust it worked.
+            current = self.get_doc(doctype, name)
+            if current.get("docstatus") == 1:
+                return current
+            raise RuntimeError(f"Submit failed for {doctype} {name}: response was {resp.status_code} {resp.text[:200]}")
 
     def cancel(self, doctype: str, name: str) -> dict[str, Any]:
         return self._client.cancel(doctype, name)
 
     def set_value(self, doctype: str, name: str, fieldname: str, value: Any) -> dict[str, Any]:
-        return self._client.set_value(doctype, name, fieldname, value)
+        last_exc: Exception | None = None
+        for attempt in range(_DEADLOCK_RETRIES):
+            try:
+                return self._client.set_value(doctype, name, fieldname, value)
+            except Exception as exc:
+                if _is_retryable(exc):
+                    last_exc = exc
+                    time.sleep(_DEADLOCK_DELAY * (attempt + 1))
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
 
 
 @lru_cache
