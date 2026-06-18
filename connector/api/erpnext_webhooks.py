@@ -110,8 +110,11 @@ async def erpnext_stock_webhook(
     shopify_client: ShopifyClientProtocol = Depends(get_shopify_client),
     erpnext_client: ERPNextClientProtocol = Depends(get_erpnext_client),
 ) -> dict[str, str]:
-    """Frappe Webhook for Stock Entry / Stock Reconciliation `on_submit`. Disabled."""
-    # Inventory sync disabled — acknowledge so ERPNext doesn't retry.
+    """Frappe Webhook for Stock Entry / Stock Reconciliation `on_submit`."""
+    payload = await _body(request)
+    if payload is None:
+        return {"status": "ok"}
+    background_tasks.add_task(inventory.handle_stock_webhook, session, shopify_client, erpnext_client, payload)
     return {"status": "ok"}
 
 

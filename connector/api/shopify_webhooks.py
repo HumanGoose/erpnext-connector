@@ -115,14 +115,16 @@ async def shopify_refunds_webhook(
 @router.post("/webhooks/shopify/inventory")
 async def shopify_inventory_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_shopify_hmac_sha256: str | None = Header(default=None),
     x_shopify_topic: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
     session: Session = Depends(get_session),
     erpnext_client: ERPNextClientProtocol = Depends(get_erpnext_client),
 ) -> dict[str, str]:
-    # Inventory sync disabled — Stock Reconciliation submission is unreliable
-    # on this Frappe version. Acknowledge the webhook so Shopify stops retrying.
+    payload = await _verified_payload(request, x_shopify_hmac_sha256, settings)
+    if x_shopify_topic == "inventory_levels/update":
+        background_tasks.add_task(inventory.handle_shopify_inventory_webhook, session, erpnext_client, payload)
     return {"status": "ok"}
 
 

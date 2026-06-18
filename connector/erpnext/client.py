@@ -84,7 +84,17 @@ class ERPNextClient:
         )
 
     def insert(self, doc: dict[str, Any]) -> dict[str, Any]:
-        return self._client.insert(doc)
+        last_exc: Exception | None = None
+        for attempt in range(_DEADLOCK_RETRIES):
+            try:
+                return self._client.insert(doc)
+            except Exception as exc:
+                if _is_retryable(exc):
+                    last_exc = exc
+                    time.sleep(_DEADLOCK_DELAY * (attempt + 1))
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
 
     def update(self, doc: dict[str, Any]) -> dict[str, Any]:
         last_exc: Exception | None = None
@@ -107,14 +117,14 @@ class ERPNextClient:
 
         frappeclient.submit() crashes with JSONDecodeError when Frappe returns
         an empty or non-JSON body (observed in Frappe v15 on Stock Reconciliation
-        submit). We fall back to a direct PUT that sets docstatus=1 via the REST
-        resource endpoint, which is the canonical Frappe way to submit docs.
+        submit). We fall back to calling frappe.client.submit directly via the
+        method API, which is the correct Frappe endpoint for submitting docs
+        (the resource PUT endpoint rejects docstatus changes with 417).
         """
         try:
             result = self._client.submit(doc)
             return result if isinstance(result, dict) else doc
-        except (json.JSONDecodeError, _requests.exceptions.JSONDecodeError, ValueError):
-            # Empty/non-JSON response — attempt the REST PUT fallback.
+        except (json.JSONDecodeError, _requests.exceptions.JSONDecodeError, ValueError, IOError):
             pass
 
         name = doc.get("name")
@@ -122,17 +132,17 @@ class ERPNextClient:
         if not name or not doctype:
             raise RuntimeError(f"Cannot submit doc without doctype/name: {doc}")
 
-        url = f"{self._client.url}/api/resource/{doctype}/{name}"
-        resp = self._client.session.put(
+        url = f"{self._client.url}/api/method/frappe.client.submit"
+        resp = self._client.session.post(
             url,
-            data={"data": json.dumps({**doc, "docstatus": 1})},
+            data={"doc": json.dumps({**doc, "docstatus": 1})},
             verify=self._client.verify,
         )
-        resp.raise_for_status()
         try:
-            return resp.json().get("data") or doc
+            resp.raise_for_status()
+            return resp.json().get("message") or doc
         except Exception:
-            # If that also returns empty body, check docstatus and trust it worked.
+            # If the method API also returns empty/error, verify docstatus directly.
             current = self.get_doc(doctype, name)
             if current.get("docstatus") == 1:
                 return current
