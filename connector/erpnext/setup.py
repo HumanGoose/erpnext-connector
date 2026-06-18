@@ -56,6 +56,16 @@ CUSTOM_FIELDS: list[dict[str, str]] = [
         "default": "Active",
         "insert_after": "sync_to_shopify",
         "read_only_depends_on": "eval:doc.variant_of",
+        "in_list_view": 1,
+    },
+    {
+        "dt": "Item",
+        "fieldname": "connector_available_qty",
+        "label": "Available Qty",
+        "fieldtype": "Float",
+        "insert_after": "shopify_status",
+        "read_only": 1,
+        "in_list_view": 1,
     },
     {
         "dt": "Item",
@@ -213,6 +223,8 @@ def register_custom_fields(client: ERPNextClientProtocol) -> list[str]:
                 updates["options"] = field["options"]
             if (existing[0].get("read_only_depends_on") or "") != (field.get("read_only_depends_on") or ""):
                 updates["read_only_depends_on"] = field.get("read_only_depends_on") or ""
+            if int(existing[0].get("in_list_view") or 0) != int(field.get("in_list_view") or 0):
+                updates["in_list_view"] = int(field.get("in_list_view") or 0)
             if updates:
                 client.update({"doctype": "Custom Field", "name": existing[0]["name"], **updates})
                 created.append(f"{field['dt']}.{field['fieldname']} (updated)")

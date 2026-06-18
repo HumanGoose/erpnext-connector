@@ -57,10 +57,11 @@ def push_item_inventory(
     """Push the current ERPNext bin quantity to Shopify immediately.
 
     Used as an initial sync after a product/variant is first created in Shopify
-    from ERPNext so the opening stock is reflected right away. No-op when
-    SHOPIFY_LOCATION_GID is still the placeholder value.
+    from ERPNext so the opening stock is reflected right away. Also updates
+    connector_available_qty regardless of Shopify location configuration.
     """
     settings = get_settings()
+    _update_available_qty(erpnext_client, item_code, settings.erpnext_warehouse)
     if settings.shopify_location_gid in ("", "gid://shopify/Location/00000000"):
         return
     _sync_item_inventory(session, shopify_client, erpnext_client, settings, item_code)
@@ -104,6 +105,34 @@ def handle_stock_webhook(
             continue
         seen.add(item_code)
         _sync_item_inventory(session, shopify_client, erpnext_client, settings, item_code)
+        _update_available_qty(erpnext_client, item_code, settings.erpnext_warehouse)
+
+
+def _update_available_qty(
+    erpnext_client: ERPNextClientProtocol,
+    item_code: str,
+    warehouse: str,
+) -> None:
+    """Write connector_available_qty on the item and its parent template (if any).
+
+    For variants, also sums all sibling quantities and writes the total to the
+    parent template so the list view shows meaningful stock at every level.
+    """
+    qty = _erpnext_quantity(erpnext_client, item_code, warehouse)
+    erpnext_client.set_value("Item", item_code, "connector_available_qty", qty)
+
+    item = erpnext_client.get_doc("Item", item_code)
+    parent = item.get("variant_of")
+    if not parent:
+        return
+
+    variants = erpnext_client.get_list(
+        "Item",
+        filters={"variant_of": parent},
+        fields=["name"],
+    )
+    total = sum(_erpnext_quantity(erpnext_client, v["name"], warehouse) for v in variants)
+    erpnext_client.set_value("Item", parent, "connector_available_qty", total)
 
 
 def _sync_item_inventory(
